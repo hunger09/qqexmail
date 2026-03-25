@@ -4,10 +4,6 @@ import { simpleParser } from 'mailparser';
 const account = process.env.EXMAIL_ACCOUNT;
 const authCode = process.env.EXMAIL_AUTH_CODE;
 
-if (!account || !authCode) {
-  console.error('请设置环境变量 EXMAIL_ACCOUNT 和 EXMAIL_AUTH_CODE');
-  process.exit(1);
-}
 const imap = new Imap({
   user: account,
   password: authCode,
@@ -40,26 +36,32 @@ imap.once('ready', () => {
       return;
     }
     
-    // 获取最近5封邮件
-    const limit = Math.min(5, box.messages.total);
-    const fetch = imap.seq.fetch(`${box.messages.total - limit + 1}:${box.messages.total}`, { bodies: '' });
-    const emails = [];
+    // 解析命令行参数
+    const args = process.argv.slice(2);
+    const limitIdx = args.indexOf('--limit');
+    const daysIdx = args.indexOf('--days');
+    let limit = 10;
+    if (limitIdx !== -1 && args[limitIdx + 1]) limit = parseInt(args[limitIdx + 1], 10) || 10;
+    
+    const actualLimit = Math.min(limit, box.messages.total);
+    const fetchRange = `${box.messages.total - actualLimit + 1}:${box.messages.total}`;
+    const fetch = imap.seq.fetch(fetchRange, { bodies: '' });
+    const emailPromises = [];
     
     fetch.on('message', (msg, seqno) => {
-      let uid;
-      msg.once('attributes', (attrs) => {
-        uid = attrs.uid;
-      });
-      
-      msg.on('body', (stream) => {
-        simpleParser(stream, (err, parsed) => {
-          if (err) {
+      const p = new Promise((resolve) => {
+        let uid;
+        msg.once('attributes', (attrs) => { uid = attrs.uid; });
+        msg.on('body', (stream) => {
+          simpleParser(stream).then((parsed) => {
+            resolve({ parsed, uid, seqno });
+          }).catch((err) => {
             console.error('解析邮件失败:', err);
-            return;
-          }
-          emails.push({ parsed, uid, seqno });
+            resolve(null);
+          });
         });
       });
+      emailPromises.push(p);
     });
     
     fetch.once('error', (err) => {
@@ -68,31 +70,34 @@ imap.once('ready', () => {
     });
     
     fetch.once('end', () => {
-      console.log(`获取到 ${emails.length} 封邮件\n`);
-      
-      // 按日期倒序
-      emails.sort((a, b) => {
-        const da = a.parsed.date ? new Date(a.parsed.date).getTime() : 0;
-        const db = b.parsed.date ? new Date(b.parsed.date).getTime() : 0;
-        return db - da;
-      });
-      
-      emails.forEach((item, i) => {
-        const e = item.parsed;
-        const from = e.from?.text || e.from?.value?.[0]?.address || '';
-        const date = e.date ? new Date(e.date).toLocaleString() : '';
-        const preview = getPreview(e.text || e.html);
+      Promise.all(emailPromises).then((emails) => {
+        const valid = emails.filter(Boolean);
+        console.log(`获取到 ${valid.length} 封邮件\n`);
         
-        console.log(`--- ${i + 1} ---`);
-        console.log('主题:', e.subject || '(无主题)');
-        console.log('发件人:', from);
-        console.log('日期:', date);
-        console.log('UID:', item.uid);
-        console.log('摘要:', preview);
-        console.log('');
+        // 按日期倒序
+        valid.sort((a, b) => {
+          const da = a.parsed.date ? new Date(a.parsed.date).getTime() : 0;
+          const db = b.parsed.date ? new Date(b.parsed.date).getTime() : 0;
+          return db - da;
+        });
+        
+        valid.forEach((item, i) => {
+          const e = item.parsed;
+          const from = e.from?.text || e.from?.value?.[0]?.address || '';
+          const date = e.date ? new Date(e.date).toLocaleString() : '';
+          const preview = getPreview(e.text || e.html);
+          
+          console.log(`--- ${i + 1} ---`);
+          console.log('主题:', e.subject || '(无主题)');
+          console.log('发件人:', from);
+          console.log('日期:', date);
+          console.log('UID:', item.uid);
+          console.log('摘要:', preview);
+          console.log('');
+        });
+        
+        imap.end();
       });
-      
-      imap.end();
     });
   });
 });
